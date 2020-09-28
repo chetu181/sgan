@@ -1,5 +1,11 @@
 import torch
 import torch.nn as nn
+import logging
+import sys
+
+FORMAT = '[%(levelname)s: %(filename)s: %(lineno)4d]: %(message)s'
+logging.basicConfig(level=logging.INFO, format=FORMAT, stream=sys.stdout)
+logger = logging.getLogger(__name__)
 
 
 def make_mlp(dim_list, activation='relu', batch_norm=True, dropout=0):
@@ -17,11 +23,11 @@ def make_mlp(dim_list, activation='relu', batch_norm=True, dropout=0):
     return nn.Sequential(*layers)
 
 
-def get_noise(shape, noise_type):
+def get_noise(shape, noise_type, use_gpu=False):
     if noise_type == 'gaussian':
-        return torch.randn(*shape).cuda()
+        return torch.randn(*shape).cuda() if use_gpu else torch.randn(*shape)
     elif noise_type == 'uniform':
-        return torch.rand(*shape).sub_(0.5).mul_(2.0).cuda()
+        return torch.rand(*shape).sub_(0.5).mul_(2.0).cuda() if use_gpu else torch.rand(*shape).sub_(0.5).mul_(2.0)
     raise ValueError('Unrecognized noise type "%s"' % noise_type)
 
 
@@ -30,7 +36,7 @@ class Encoder(nn.Module):
     TrajectoryDiscriminator"""
     def __init__(
         self, embedding_dim=64, h_dim=64, mlp_dim=1024, num_layers=1,
-        dropout=0.0
+        dropout=0.0, use_gpu=False
     ):
         super(Encoder, self).__init__()
 
@@ -42,14 +48,15 @@ class Encoder(nn.Module):
         self.encoder = nn.LSTM(
             embedding_dim, h_dim, num_layers, dropout=dropout
         )
-
+        self.use_gpu = use_gpu
         self.spatial_embedding = nn.Linear(2, embedding_dim)
 
     def init_hidden(self, batch):
-        return (
-            torch.zeros(self.num_layers, batch, self.h_dim).cuda(),
-            torch.zeros(self.num_layers, batch, self.h_dim).cuda()
+        toret = (torch.zeros(self.num_layers, batch, self.h_dim),
+            torch.zeros(self.num_layers, batch, self.h_dim)
         )
+        if(self.use_gpu):
+            return (toret[0].cuda(), toret[1].cuda())
 
     def forward(self, obs_traj):
         """
@@ -60,7 +67,8 @@ class Encoder(nn.Module):
         """
         # Encode observed Trajectory
         batch = obs_traj.size(1)
-        obs_traj_embedding = self.spatial_embedding(obs_traj.view(-1, 2))
+        logger.debug("self.use_gpu "+str(self.use_gpu))
+        obs_traj_embedding = self.spatial_embedding(obs_traj.view(-1, 2)) if self.use_gpu else self.spatial_embedding(obs_traj.reshape(-1, 2))
         obs_traj_embedding = obs_traj_embedding.view(
             -1, batch, self.embedding_dim
         )
@@ -357,7 +365,8 @@ class TrajectoryGenerator(nn.Module):
         decoder_h_dim=128, mlp_dim=1024, num_layers=1, noise_dim=(0, ),
         noise_type='gaussian', noise_mix_type='ped', pooling_type=None,
         pool_every_timestep=True, dropout=0.0, bottleneck_dim=1024,
-        activation='relu', batch_norm=True, neighborhood_size=2.0, grid_size=8
+        activation='relu', batch_norm=True, neighborhood_size=2.0, grid_size=8,
+        use_gpu = False
     ):
         super(TrajectoryGenerator, self).__init__()
 
@@ -378,13 +387,15 @@ class TrajectoryGenerator(nn.Module):
         self.noise_first_dim = 0
         self.pool_every_timestep = pool_every_timestep
         self.bottleneck_dim = 1024
+        self.use_gpu = use_gpu
 
         self.encoder = Encoder(
             embedding_dim=embedding_dim,
             h_dim=encoder_h_dim,
             mlp_dim=mlp_dim,
             num_layers=num_layers,
-            dropout=dropout
+            dropout=dropout,
+            use_gpu=use_gpu
         )
 
         self.decoder = Decoder(
@@ -421,11 +432,11 @@ class TrajectoryGenerator(nn.Module):
                 neighborhood_size=neighborhood_size,
                 grid_size=grid_size
             )
-
-        if self.noise_dim[0] == 0:
-            self.noise_dim = None
-        else:
-            self.noise_first_dim = noise_dim[0]
+        if self.noise_dim is not None:
+            if self.noise_dim[0] == 0:
+                self.noise_dim = None
+            else:
+                self.noise_first_dim = noise_dim[0]
 
         # Decoder Hidden
         if pooling_type:
@@ -466,7 +477,7 @@ class TrajectoryGenerator(nn.Module):
         if user_noise is not None:
             z_decoder = user_noise
         else:
-            z_decoder = get_noise(noise_shape, self.noise_type)
+            z_decoder = get_noise(noise_shape, self.noise_type, self.use_gpu)
 
         if self.noise_mix_type == 'global':
             _list = []
@@ -528,8 +539,9 @@ class TrajectoryGenerator(nn.Module):
 
         decoder_c = torch.zeros(
             self.num_layers, batch, self.decoder_h_dim
-        ).cuda()
-
+        )
+        if(self.use_gpu):
+            decoder_c = decoder_c.cuda()
         state_tuple = (decoder_h, decoder_c)
         last_pos = obs_traj[-1]
         last_pos_rel = obs_traj_rel[-1]
@@ -550,7 +562,7 @@ class TrajectoryDiscriminator(nn.Module):
     def __init__(
         self, obs_len, pred_len, embedding_dim=64, h_dim=64, mlp_dim=1024,
         num_layers=1, activation='relu', batch_norm=True, dropout=0.0,
-        d_type='local'
+        d_type='local', use_gpu = False
     ):
         super(TrajectoryDiscriminator, self).__init__()
 
@@ -566,7 +578,8 @@ class TrajectoryDiscriminator(nn.Module):
             h_dim=h_dim,
             mlp_dim=mlp_dim,
             num_layers=num_layers,
-            dropout=dropout
+            dropout=dropout,
+            use_gpu= use_gpu
         )
 
         real_classifier_dims = [h_dim, mlp_dim, 1]
