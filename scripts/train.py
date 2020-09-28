@@ -20,6 +20,7 @@ from sgan.utils import int_tuple, bool_flag, get_total_norm
 from sgan.utils import relative_to_abs, get_dset_path
 
 torch.backends.cudnn.benchmark = True
+torch.manual_seed(13)
 
 parser = argparse.ArgumentParser()
 FORMAT = '[%(levelname)s: %(filename)s: %(lineno)4d]: %(message)s'
@@ -76,6 +77,7 @@ parser.add_argument('--clipping_threshold_d', default=0, type=float)
 
 # Loss Options
 parser.add_argument('--l2_loss_weight', default=0, type=float)
+parser.add_argument('--cosine_loss_weight', default=0, type=float)
 parser.add_argument('--best_k', default=1, type=int)
 
 # Output
@@ -437,6 +439,21 @@ def generator_step(
             g_l2_loss_sum_rel += _g_l2_loss_rel
         losses['G_l2_loss_rel'] = g_l2_loss_sum_rel.item()
         loss += g_l2_loss_sum_rel
+
+    if args.cosine_loss_weight > 0: # TODO : what to do when curvature loss needs to be included?
+        # need to obtain the curvature for all data points in the batch. And save their average to curvature_loss tensor..
+        # given pred_traj_fake_rel, and last two inputs(may be not needed for first iteration). pred_traj_gt_rel(not needed)
+        # print("COSINE: pred_traj_fake_rel.shape", pred_traj_fake_rel.shape)
+        # print("pred_traj_fake_rel", pred_traj_fake_rel) # just use this tensor for now, then you can add other stuff later.
+        pred_traj_fake_rel_shifted = torch.roll(pred_traj_fake_rel, 1, [1])
+        # print("pred_traj_fake_rel_shifted", pred_traj_fake_rel_shifted)
+        cosfunc = nn.CosineSimilarity(dim=2, eps=1e-6)
+        similarity = cosfunc(pred_traj_fake_rel, pred_traj_fake_rel_shifted)
+        # print("similarity", similarity)
+        cosine_loss = torch.sum(similarity[1:,:])
+        print("cosine_loss", cosine_loss)
+        loss += -args.cosine_loss_weight * cosine_loss
+        # sys.exit()
 
     traj_fake = torch.cat([obs_traj, pred_traj_fake], dim=0)
     traj_fake_rel = torch.cat([obs_traj_rel, pred_traj_fake_rel], dim=0)
