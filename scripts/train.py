@@ -19,6 +19,31 @@ from sgan.models import TrajectoryGenerator, TrajectoryDiscriminator
 from sgan.utils import int_tuple, bool_flag, get_total_norm
 from sgan.utils import relative_to_abs, get_dset_path
 
+import tensorflow as tf
+import datetime
+
+# Tensorboard 
+current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+train_log_dir = './logs/' + current_time # [edit to suit experiment]
+writer = tf.summary.FileWriter(train_log_dir)
+writer.add_graph(tf.get_default_graph())
+
+# start a session (this should be done quite late)
+sess = tf.Session()
+sess.run(tf.global_variables_initializer())
+
+placeholders={}
+summary_tensors={}
+
+def add_summary(legend, value, step):
+    if(legend not in placeholders): # create summary tensor if not present.
+        placeholders[legend] = tf.placeholder(dtype=tf.float32)
+        summary_tensors[legend] = tf.summary.scalar(
+            name=legend, tensor=placeholders[legend])
+    summary = sess.run(summary_tensors[legend], feed_dict={placeholders[legend]:value})
+    writer.add_summary(summary, step)
+
+
 torch.backends.cudnn.benchmark = True
 torch.manual_seed(13)
 
@@ -123,6 +148,11 @@ def main(args):
     _, val_loader = data_loader(args, val_path)
 
     iterations_per_epoch = len(train_dset) / args.batch_size / args.d_steps
+    print(" len(train_dset)", len(train_dset))
+    print("args.batch_size",  args.batch_size)
+    print("args.d_steps", args.d_steps)
+    print("iterations_per_epoch", iterations_per_epoch)
+    
     if args.num_epochs:
         args.num_iterations = int(iterations_per_epoch * args.num_epochs)
 
@@ -229,6 +259,8 @@ def main(args):
         }
     t0 = None
     while t < args.num_iterations:
+        #add_summary('t_iter', t, t)
+        print("t = ", t)
         gc.collect()
         d_steps_left = args.d_steps
         g_steps_left = args.g_steps
@@ -282,9 +314,11 @@ def main(args):
                 for k, v in sorted(losses_d.items()):
                     logger.info('  [D] {}: {:.3f}'.format(k, v))
                     checkpoint['D_losses'][k].append(v)
+                    add_summary('Dis_'+k, v, t)
                 for k, v in sorted(losses_g.items()):
                     logger.info('  [G] {}: {:.3f}'.format(k, v))
                     checkpoint['G_losses'][k].append(v)
+                    add_summary('Gen_'+k, v, t)
                 checkpoint['losses_ts'].append(t)
 
             # Maybe save a checkpoint
@@ -303,6 +337,10 @@ def main(args):
                     args, train_loader, generator, discriminator,
                     d_loss_fn, limit=True
                 )
+                add_summary('ade_train', v, t)
+                add_summary('ade_VAL', v, t)
+                add_summary('FDE_train', v, t)
+                add_summary('FDE_VAL', v, t)
 
                 for k, v in sorted(metrics_val.items()):
                     logger.info('  [val] {}: {:.3f}'.format(k, v))
@@ -361,6 +399,10 @@ def main(args):
             g_steps_left = args.g_steps
             if t >= args.num_iterations:
                 break
+# close tensorboard writer
+#writer.flush()
+#writer.close()
+
 
 
 def discriminator_step(
