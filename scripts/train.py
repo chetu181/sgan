@@ -22,26 +22,9 @@ from sgan.utils import relative_to_abs, get_dset_path
 import tensorflow as tf
 import datetime
 
-# Tensorboard 
-current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-train_log_dir = './logs/' + current_time # [edit to suit experiment]
-writer = tf.summary.FileWriter(train_log_dir)
-writer.add_graph(tf.get_default_graph())
-
-# start a session (this should be done quite late)
-sess = tf.Session()
-sess.run(tf.global_variables_initializer())
-
-placeholders={}
-summary_tensors={}
-
-def add_summary(legend, value, step):
-    if(legend not in placeholders): # create summary tensor if not present.
-        placeholders[legend] = tf.placeholder(dtype=tf.float32)
-        summary_tensors[legend] = tf.summary.scalar(
-            name=legend, tensor=placeholders[legend])
-    summary = sess.run(summary_tensors[legend], feed_dict={placeholders[legend]:value})
-    writer.add_summary(summary, step)
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 
 
 torch.backends.cudnn.benchmark = True
@@ -99,10 +82,11 @@ parser.add_argument('--encoder_h_dim_d', default=64, type=int)
 parser.add_argument('--d_learning_rate', default=5e-4, type=float)
 parser.add_argument('--d_steps', default=2, type=int)
 parser.add_argument('--clipping_threshold_d', default=0, type=float)
-
+parser.add_argument('--use_discriminator', default=True, type=bool)
 # Loss Options
 parser.add_argument('--l2_loss_weight', default=0, type=float)
 parser.add_argument('--cosine_loss_weight', default=0, type=float)
+parser.add_argument('--curvature_loss_weight', default=0, type=float)
 parser.add_argument('--best_k', default=1, type=int)
 
 # Output
@@ -118,6 +102,27 @@ parser.add_argument('--num_samples_check', default=5000, type=int)
 parser.add_argument('--use_gpu', default=False, type=bool)
 parser.add_argument('--timing', default=0, type=int)
 parser.add_argument('--gpu_num', default="0", type=str)
+
+
+# Tensorboard
+current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+writer = None
+#writer.add_graph(tf.get_default_graph())
+
+# start a session (this should be done quite late)
+sess = tf.Session()
+sess.run(tf.global_variables_initializer())
+
+placeholders={}
+summary_tensors={}
+
+def add_summary(legend, value, step):
+    if(legend not in placeholders): # create summary tensor if not present.
+        placeholders[legend] = tf.placeholder(dtype=tf.float32)
+        summary_tensors[legend] = tf.summary.scalar(
+            name=legend, tensor=placeholders[legend])
+    summary = sess.run(summary_tensors[legend], feed_dict={placeholders[legend]:value})
+    writer.add_summary(summary, step)
 
 
 def init_weights(m):
@@ -337,10 +342,10 @@ def main(args):
                     args, train_loader, generator, discriminator,
                     d_loss_fn, limit=True
                 )
-                add_summary('ade_train', v, t)
-                add_summary('ade_VAL', v, t)
-                add_summary('FDE_train', v, t)
-                add_summary('FDE_VAL', v, t)
+                add_summary('ade_train', metrics_train['ade'], t)
+                add_summary('ade_VAL', metrics_val['ade'], t)
+                add_summary('FDE_train', metrics_train['fde'], t)
+                add_summary('FDE_VAL', metrics_val['fde'], t)
 
                 for k, v in sorted(metrics_val.items()):
                     logger.info('  [val] {}: {:.3f}'.format(k, v))
@@ -487,7 +492,8 @@ def generator_step(
         # given pred_traj_fake_rel, and last two inputs(may be not needed for first iteration). pred_traj_gt_rel(not needed)
         # print("COSINE: pred_traj_fake_rel.shape", pred_traj_fake_rel.shape)
         # print("pred_traj_fake_rel", pred_traj_fake_rel) # just use this tensor for now, then you can add other stuff later.
-        pred_traj_fake_rel_shifted = torch.roll(pred_traj_fake_rel, 1, [1])
+        #pred_traj_fake_rel_shifted = torch.roll(pred_traj_fake_rel, 1, [1])
+        pred_traj_fake_rel_shifted = torch.cat( (pred_traj_fake_rel[1:, :, :],  pred_traj_fake_rel[:1, :, :]), dim=0) # simulating rolling
         # print("pred_traj_fake_rel_shifted", pred_traj_fake_rel_shifted)
         cosfunc = nn.CosineSimilarity(dim=2, eps=1e-6)
         similarity = cosfunc(pred_traj_fake_rel, pred_traj_fake_rel_shifted)
@@ -497,13 +503,56 @@ def generator_step(
         loss += -args.cosine_loss_weight * cosine_loss
         # sys.exit()
 
+    if args.curvature_loss_weight > 0:
+        print("CURVATURE: pred_traj_fake_rel.shape", pred_traj_fake_rel.shape)
+        # print("pred_traj_fake_rel", pred_traj_fake_rel) # just use this tensor for now, then you can add other stuff later.
+        dists = torch.norm(pred_traj_fake_rel,p=2, dim=2)
+        # print("dists", dists)
+        print("dists.shape", dists.shape)
+
+        # get 3 sets of points aas, bbs and ccs corresponding to 3 subsequent points
+        aas = torch.cat( (obs_traj[-3:-1,:,:], pred_traj_fake[:-2,:,:]) , dim=0)
+        bbs = torch.cat( (obs_traj[-2:-1,:,:], pred_traj_fake[:-1,:,:]) , dim=0)
+        ccs = pred_traj_fake
+        # print("obs_traj[-3:,:3,:]", obs_traj[-3:,:3,:])
+        # print("aas.shape", aas.shape)
+        # print("bbs.shape", bbs.shape)
+        # print("ccs.shape", ccs.shape)
+        # print("aas:\n", aas)
+        # print("bbs:\n", bbs)
+        # print("ccs:\n", ccs)
+        cside = torch.norm(aas-bbs ,p=2, dim=2) + 0.0001
+        bside = torch.norm(aas-ccs ,p=2, dim=2)
+        aside = torch.norm(ccs-bbs ,p=2, dim=2)
+        # print("cside.shape", cside.shape)
+        s = (aside + bside + cside) / 2
+        areas = torch.sqrt(s * (s-aside)* (s-bside)* (s-cside))
+        curvatures = areas/aside/bside/cside
+        # print("curvatures.shape", curvatures.shape)
+        # print("aside", aside)
+        # print("bside", bside)
+        # print("cside", cside)
+
+        # print("areas", areas)
+        # print("curvatures", curvatures)
+
+        curvature_loss = torch.sum(curvatures)
+        curvature_loss[curvature_loss != curvature_loss] = 0 #setting nan as zero
+        print("curvature_loss", curvature_loss)
+        loss += args.curvature_loss_weight * curvature_loss
+        # sys.exit()
+
+
+
     traj_fake = torch.cat([obs_traj, pred_traj_fake], dim=0)
     traj_fake_rel = torch.cat([obs_traj_rel, pred_traj_fake_rel], dim=0)
 
     scores_fake = discriminator(traj_fake, traj_fake_rel, seq_start_end)
     discriminator_loss = g_loss_fn(scores_fake)
 
-    loss += discriminator_loss
+    if args.use_discriminator:
+        print("using discriminator loss")
+        loss += discriminator_loss
     losses['G_discriminator_loss'] = discriminator_loss.item()
     losses['G_total_loss'] = loss.item()
 
@@ -641,4 +690,6 @@ def cal_fde(
 
 if __name__ == '__main__':
     args = parser.parse_args()
+    train_log_dir = './logs/'+args.checkpoint_name +'_'+ current_time # [edit to suit experiment]
+    writer = tf.summary.FileWriter(train_log_dir)
     main(args)
