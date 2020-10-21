@@ -1,3 +1,6 @@
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
 import argparse
 import gc
 import logging
@@ -21,12 +24,12 @@ from sgan.utils import relative_to_abs, get_dset_path
 
 import tensorflow as tf
 import datetime
-
+from torch import autograd
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 
-
+torch.set_printoptions(edgeitems=1000)
 torch.backends.cudnn.benchmark = True
 torch.manual_seed(13)
 
@@ -100,18 +103,21 @@ parser.add_argument('--num_samples_check', default=5000, type=int)
 
 # Misc
 parser.add_argument('--use_gpu', default=False, type=bool)
+parser.add_argument('--use_tboard', default=False, type=bool)
 parser.add_argument('--timing', default=0, type=int)
 parser.add_argument('--gpu_num', default="0", type=str)
+args = parser.parse_args()
 
-
+use_tboard = args.use_tboard
 # Tensorboard
 current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 writer = None
 #writer.add_graph(tf.get_default_graph())
 
 # start a session (this should be done quite late)
-sess = tf.Session()
-sess.run(tf.global_variables_initializer())
+if(use_tboard):
+    sess = tf.Session()
+    sess.run(tf.global_variables_initializer())
 
 placeholders={}
 summary_tensors={}
@@ -188,7 +194,7 @@ def main(args):
     generator.apply(init_weights)
     generator.type(float_dtype).train()
     logger.info('Here is the generator:')
-    logger.info(generator)
+    # logger.info(generator)
 
     discriminator = TrajectoryDiscriminator(
         obs_len=args.obs_len,
@@ -205,11 +211,11 @@ def main(args):
     discriminator.apply(init_weights)
     discriminator.type(float_dtype).train()
     logger.info('Here is the discriminator:')
-    logger.info(discriminator)
+    # logger.info(discriminator)
 
     g_loss_fn = gan_g_loss
     d_loss_fn = gan_d_loss
-
+    
     optimizer_g = optim.Adam(generator.parameters(), lr=args.g_learning_rate)
     optimizer_d = optim.Adam(
         discriminator.parameters(), lr=args.d_learning_rate
@@ -218,7 +224,7 @@ def main(args):
     # Maybe restore from checkpoint
     restore_path = None
     if args.checkpoint_start_from is not None:
-        restore_path = args.checkpoint_start_from
+        restore_path = args.checkpoint_start_fromf
     elif args.restore_from_checkpoint == 1:
         restore_path = os.path.join(args.output_dir,
                                     '%s_with_model.pt' % args.checkpoint_name)
@@ -266,6 +272,7 @@ def main(args):
     while t < args.num_iterations:
         #add_summary('t_iter', t, t)
         print("t = ", t)
+        # print("generator weights: ", [x.data for x in generator.decoder.parameters()])
         gc.collect()
         d_steps_left = args.d_steps
         g_steps_left = args.g_steps
@@ -289,6 +296,7 @@ def main(args):
                 d_steps_left -= 1
             elif g_steps_left > 0:
                 step_type = 'g'
+                print("get step t = ", t)
                 losses_g = generator_step(args, batch, generator,
                                           discriminator, g_loss_fn,
                                           optimizer_g)
@@ -319,11 +327,11 @@ def main(args):
                 for k, v in sorted(losses_d.items()):
                     logger.info('  [D] {}: {:.3f}'.format(k, v))
                     checkpoint['D_losses'][k].append(v)
-                    add_summary('Dis_'+k, v, t)
+                    if(use_tboard): add_summary('Dis_'+k, v, t)
                 for k, v in sorted(losses_g.items()):
                     logger.info('  [G] {}: {:.3f}'.format(k, v))
                     checkpoint['G_losses'][k].append(v)
-                    add_summary('Gen_'+k, v, t)
+                    if(use_tboard): add_summary('Gen_'+k, v, t)
                 checkpoint['losses_ts'].append(t)
 
             # Maybe save a checkpoint
@@ -342,10 +350,11 @@ def main(args):
                     args, train_loader, generator, discriminator,
                     d_loss_fn, limit=True
                 )
-                add_summary('ade_train', metrics_train['ade'], t)
-                add_summary('ade_VAL', metrics_val['ade'], t)
-                add_summary('FDE_train', metrics_train['fde'], t)
-                add_summary('FDE_VAL', metrics_val['fde'], t)
+                if(use_tboard):
+                    add_summary('ade_train', metrics_train['ade'], t)
+                    add_summary('ade_VAL', metrics_val['ade'], t)
+                    add_summary('FDE_train', metrics_train['fde'], t)
+                    add_summary('FDE_VAL', metrics_val['fde'], t)
 
                 for k, v in sorted(metrics_val.items()):
                     logger.info('  [val] {}: {:.3f}'.format(k, v))
@@ -498,11 +507,13 @@ def generator_step(
         cosfunc = nn.CosineSimilarity(dim=2, eps=1e-6)
         similarity = cosfunc(pred_traj_fake_rel, pred_traj_fake_rel_shifted)
         # print("similarity", similarity)
-        cosine_loss = torch.sum(similarity[1:,:])
+        cosine_loss = torch.mean(similarity[1:,:])
+        losses['G_cosine_loss'] = cosine_loss.item()
         print("cosine_loss", cosine_loss)
         loss += -args.cosine_loss_weight * cosine_loss
         # sys.exit()
-
+    curv_debug = False
+    print("loss before adding curvature", loss)
     if args.curvature_loss_weight > 0:
         print("CURVATURE: pred_traj_fake_rel.shape", pred_traj_fake_rel.shape)
         # print("pred_traj_fake_rel", pred_traj_fake_rel) # just use this tensor for now, then you can add other stuff later.
@@ -511,23 +522,39 @@ def generator_step(
         print("dists.shape", dists.shape)
 
         # get 3 sets of points aas, bbs and ccs corresponding to 3 subsequent points
-        aas = torch.cat( (obs_traj[-3:-1,:,:], pred_traj_fake[:-2,:,:]) , dim=0)
-        bbs = torch.cat( (obs_traj[-2:-1,:,:], pred_traj_fake[:-1,:,:]) , dim=0)
+        aas = torch.cat( (obs_traj[-2:,:,:], pred_traj_fake[:-2,:,:]) , dim=0)
+        print("aas.dtype", aas.dtype)
+        bbs = torch.cat( (obs_traj[-1:,:,:], pred_traj_fake[:-1,:,:]) , dim=0)
         ccs = pred_traj_fake
         # print("obs_traj[-3:,:3,:]", obs_traj[-3:,:3,:])
-        # print("aas.shape", aas.shape)
-        # print("bbs.shape", bbs.shape)
-        # print("ccs.shape", ccs.shape)
-        # print("aas:\n", aas)
-        # print("bbs:\n", bbs)
-        # print("ccs:\n", ccs)
-        cside = torch.norm(aas-bbs ,p=2, dim=2) + 0.0001
+        if(curv_debug):
+            print("aas.shape", aas.shape)
+            print("bbs.shape", bbs.shape)
+            print("ccs.shape", ccs.shape)               
+            print("aas:\n", aas)
+            print("bbs:\n", bbs)
+            print("ccs:\n", ccs)    
+        cside = torch.norm(aas-bbs ,p=2, dim=2) 
         bside = torch.norm(aas-ccs ,p=2, dim=2)
         aside = torch.norm(ccs-bbs ,p=2, dim=2)
         # print("cside.shape", cside.shape)
         s = (aside + bside + cside) / 2
         areas = torch.sqrt(s * (s-aside)* (s-bside)* (s-cside))
+
+        if curv_debug:
+            onne = torch.ones(areas.shape).cuda()
+            zeero = torch.zeros(areas.shape).cuda()
+            print("onne.shape", onne.shape)
+            print("zeero.shape", zeero.shape)
+            debug_ars = torch.where(areas<0.00001, onne, zeero)
+            areas = torch.where(areas < 0.0001, zeero, areas)
+            debug_ars_sum = torch.sum(debug_ars)
+            print("debug_ars_sum: ", debug_ars_sum)
+        # print("areas : ", areas)
         curvatures = areas/aside/bside/cside
+        exp = (curvatures != curvatures)
+        curvatures[exp] = 0
+        # curvatures = curvatures * exp
         # print("curvatures.shape", curvatures.shape)
         # print("aside", aside)
         # print("bside", bside)
@@ -535,14 +562,46 @@ def generator_step(
 
         # print("areas", areas)
         # print("curvatures", curvatures)
-
-        curvature_loss = torch.sum(curvatures)
-        curvature_loss[curvature_loss != curvature_loss] = 0 #setting nan as zero
+        # curvatures[curvatures != curvatures] = 0
+        curvature_loss = torch.mean(curvatures)
+        # curvature_loss[curvature_lFoss != curvature_loss] = 0 #setting nan as zero
         print("curvature_loss", curvature_loss)
+        losses['G_curvature_loss'] = curvature_loss.item()
         loss += args.curvature_loss_weight * curvature_loss
         # sys.exit()
 
+    if(loss != loss):
+        print("[id]" , "is where you see NaN first")
+        print("loss", loss)
+        print("curvature_loss Nan", curvature_loss)
+        print("\n\n==================NAN================\n\n")
+        nan_loc = 0
+        nan_id = 7
+        print("\n=====  curvatures[nan_loc,nan_id:nan_id+5]\n", curvatures[nan_loc,nan_id :nan_id+5])
+        print("\n=====  areas[nan_loc,nan_id:nan_id+5]\n", areas[nan_loc,nan_id :nan_id+5])
+        print("\n=====  aside[nan_loc,nan_id:nan_id+5]\n", aside[nan_loc,nan_id :nan_id+5])
+        print("\n=====  bside[nan_loc,nan_id:nan_id+5]\n", bside[nan_loc,nan_id :nan_id+5])
+        print("\n=====  cside[nan_loc,nan_id:nan_id+5]\n", cside[nan_loc,nan_id :nan_id+5])
+        
+        
+        print("aas.shape", aas.shape)
+        print("bbs.shape", bbs.shape)
+        print("ccs.shape", ccs.shape)               
+        print("aas:\n", aas[nan_loc,nan_id :nan_id+5])
+        print("bbs:\n", bbs[nan_loc,nan_id :nan_id+5])
+        print("ccs:\n", ccs[nan_loc,nan_id :nan_id+5])
 
+        exp = (curvatures == curvatures)
+        print("obs_traj", obs_traj[:,6:11,:])
+        print("pred_traj_fake", pred_traj_fake[:,6:11,:])
+        print("obs_traj.shape", obs_traj.shape)
+        print("pred_traj_fake.shape", pred_traj_fake.shape)
+        print ("exp", exp[:,6:11])
+        # print ("exp", exp[nan_loc,nan_id :nan_id+5])
+        # print("prevgrads", prevgrads)
+        # print("generator weights: ", [x.data for x in generator.decoder.parameters()]) 
+        # print("generator grad vals: ", [x.grad for x in generator.decoder.parameters()])
+        sys.exit() 
 
     traj_fake = torch.cat([obs_traj, pred_traj_fake], dim=0)
     traj_fake_rel = torch.cat([obs_traj_rel, pred_traj_fake_rel], dim=0)
@@ -557,13 +616,36 @@ def generator_step(
     losses['G_total_loss'] = loss.item()
 
     optimizer_g.zero_grad()
-    loss.backward()
+    if curv_debug:
+        print("generator grad vals BEFORE: ", [x.grad for x in generator.decoder.parameters()])
+    loss.backward(retain_graph=True)
+
+    for x in generator.decoder.parameters():
+        nanmask = (x.grad != x.grad)
+        # print(nanmask)
+        x.grad.data[nanmask] = 0
+        if torch.isnan(x.grad).any():
+            print("NaN generated during backprop")
+            print(x.grad)
+            sys.exit()  
+
+    if curv_debug:
+        print("generator grad vals: ", [x.grad for x in generator.decoder.parameters()])
     if args.clipping_threshold_g > 0:
         nn.utils.clip_grad_norm_(
             generator.parameters(), args.clipping_threshold_g
         )
+    
     optimizer_g.step()
+    #print some grads here to see what's going wrong:
+    if curv_debug:
+        print("autograd.grad(loss, curvature_loss)", autograd.grad(loss, curvature_loss))
+        # print("autograd.grad(loss, areas)", autograd.grad(loss, areas))
+        # print("autograd.grad(loss, aside)", autograd.grad(loss, aside))
+        # print("autograd.grad(curvature_loss, ccs)", autograd.grad(curvature_loss, ccs))
+        print("autograd.grad(curvature_loss, pred_traj_fake_rel)", autograd.grad(curvature_loss, pred_traj_fake_rel))
 
+    # sys.exit()
     return losses
 
 
@@ -689,7 +771,8 @@ def cal_fde(
 
 
 if __name__ == '__main__':
-    args = parser.parse_args()
+    print("POST AAMAS changes incoming..\n\n\n")
+    
     train_log_dir = './logs/'+args.checkpoint_name +'_'+ current_time # [edit to suit experiment]
     writer = tf.summary.FileWriter(train_log_dir)
     main(args)
